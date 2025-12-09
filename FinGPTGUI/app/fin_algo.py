@@ -32,6 +32,21 @@ def calculate_macd(data, slow=26, fast=12, signal=9):
     signal_line = macd.ewm(span=signal, adjust=False).mean()
     return macd, signal_line
 
+def calculate_atr(data, high, low, window=14):
+    tr1 = high - low
+    tr2 = (high - data.shift(1)).abs()
+    tr3 = (low - data.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=window).mean()
+    return atr
+
+def calculate_bollinger(data, window=20):
+    sma = data.rolling(window=window).mean()
+    std = data.rolling(window=window).std()
+    upper = sma + (std * 2)
+    lower = sma - (std * 2)
+    return upper, lower
+
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
         super(LSTMModel, self).__init__()
@@ -45,6 +60,31 @@ class LSTMModel(nn.Module):
         c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
         out, _ = self.lstm(x, (h0, c0))
         out = self.fc(out[:, -1, :])
+        return out
+
+# ------------------------------------------------------------
+# Simple Transformer‑based model (placeholder for a full TFT)
+# ------------------------------------------------------------
+class TFTModel(nn.Module):
+    """A lightweight Transformer encoder used as a second model.
+    It mimics the Temporal Fusion Transformer interface enough for
+    quick experimentation without pulling in the heavy `pytorch‑forecasting`
+    dependency.
+    """
+    def __init__(self, input_dim=1, d_model=64, nhead=4, num_layers=2, dim_feedforward=128, output_dim=1):
+        super(TFTModel, self).__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc_out = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        # x shape: (batch, seq_len, input_dim)
+        x = self.input_proj(x)                     # (batch, seq_len, d_model)
+        x = x.permute(1, 0, 2)                    # (seq_len, batch, d_model) for transformer
+        enc = self.transformer_encoder(x)          # (seq_len, batch, d_model)
+        enc = enc.permute(1, 0, 2)                # back to (batch, seq_len, d_model)
+        out = self.fc_out(enc[:, -1, :])           # use last timestep
         return out
 
 class FinGPTTrader:
@@ -78,6 +118,7 @@ class FinGPTTrader:
                  model = LSTMModel(input_dim=1, hidden_dim=32, num_layers=2, output_dim=1).to(self.device)
                  model.load_state_dict(torch.load(MODEL_PATH))
                  self.model = model
+                 self.tft_model = None
              except Exception as e:
                  print(f"Failed to load model: {e}")
 
@@ -121,6 +162,8 @@ class FinGPTTrader:
             df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
             df['RSI'] = calculate_rsi(df['Close'])
             df['MACD'], df['Signal_Line'] = calculate_macd(df['Close'])
+            df['ATR'] = calculate_atr(df['Close'], df['High'], df['Low'])
+            df['Upper_BB'], df['Lower_BB'] = calculate_bollinger(df['Close'])
             df.dropna(inplace=True)
             
             if ticker is None or ticker == self.ticker:
@@ -140,7 +183,10 @@ class FinGPTTrader:
                 df.columns = df.columns.get_level_values(0)
             df['Log_Ret'] = np.log(df['Close'] / df['Close'].shift(1))
             df['RSI'] = calculate_rsi(df['Close'])
+            df['RSI'] = calculate_rsi(df['Close'])
             df['MACD'], df['Signal_Line'] = calculate_macd(df['Close'])
+            df['ATR'] = calculate_atr(df['Close'], df['High'], df['Low'])
+            df['Upper_BB'], df['Lower_BB'] = calculate_bollinger(df['Close'])
             df.dropna(inplace=True)
             if target_ticker == self.ticker:
                 self.data = df
@@ -167,6 +213,124 @@ class FinGPTTrader:
         except Exception as e:
             print(f"Sentiment failed for {ticker}: {e}")
             return 0, []
+
+    # ------------------------------------------------------------
+    # TFT model handling
+    # ------------------------------------------------------------
+    def get_tft_model(self, d_model=64, nhead=4, num_layers=2, dim_feedforward=128):
+        """Instantiate or retrieve the lightweight Transformer model (TFT)."""
+        if hasattr(self, 'tft_model') and self.tft_model is not None:
+            return self.tft_model
+        print("Initializing TFT model for high‑alpha scanning...")
+        model = TFTModel(input_dim=1, d_model=d_model, nhead=nhead, num_layers=num_layers, dim_feedforward=dim_feedforward, output_dim=1).to(self.device)
+        self.tft_model = model
+        return model
+
+    def predict_horizon_tft(self, df, days=7):
+        """Generate horizon predictions using the TFT model (returns list of prices)."""
+        if not hasattr(self, 'tft_model') or self.tft_model is None:
+            self.get_tft_model()
+        model = self.tft_model
+        model.eval()
+        # Use same scaling as LSTM for consistency
+        data = df['Log_Ret'].values.reshape(-1, 1)
+        if not hasattr(self, 'scaler'):
+            return []
+        scaled = self.scaler.transform(data)
+        seq = scaled[-self.lookback:]
+        seq_tensor = torch.FloatTensor(seq).unsqueeze(0).to(self.device)
+        predictions = []
+        current_price = df['Close'].iloc[-1]
+        with torch.no_grad():
+            for _ in range(days):
+                pred_scaled = model(seq_tensor)
+                pred_val = self.scaler.inverse_transform(pred_scaled.cpu().numpy())[0][0]
+                next_price = current_price * np.exp(pred_val)
+                predictions.append(next_price)
+                new_step = torch.FloatTensor([[pred_scaled.item()]]).to(self.device)
+                seq_tensor = torch.cat((seq_tensor[:, 1:, :], new_step.unsqueeze(0)), dim=1)
+                current_price = next_price
+        return predictions
+
+    def get_weekly_movers(self):
+        """Returns a list of high-beta/high-volatility tickers likely to move 50%+"""
+        # Mix of Leveraged ETFs, Crypto Proxies, and Meme Stocks known for volatility
+        return [
+            # High Beta Tech/Semis
+            "NVDA", "AMD", "TSLA", "SMCI", "ARM", "PLTR",
+            # Leveraged ETFs (3x)
+            "TQQQ", "SQQQ", "SOXL", "SOXS", "UPRO", "SPXU", "FNGU",
+            # Crypto Proxies
+            "COIN", "MSTR", "MARA", "RIOT",
+            # Biotech/Pharma (often huge weekly moves)
+            "VKTX", "ITCI",
+            # Recent Volatile movers
+            "CVNA", "UPST", "AI", "GME"
+        ]
+
+    def scan_high_alpha_opportunities(self, progress_callback=None):
+        """Scans for High Alpha (50%+) Weekly Opportunities"""
+        tickers = self.get_weekly_movers()
+        results = []
+        
+        for i, ticker in enumerate(tickers):
+            if progress_callback:
+                progress_callback(i / len(tickers), f"Scanning {ticker} for High Alpha...")
+                
+            try:
+                df = self.fetch_data(ticker, period="1y")
+                if df is None or len(df) < 60: continue
+                
+                # Check news sentiment
+                sentiment_score, headlines = self.analyze_sentiment(ticker)
+
+                # Technical indicators and price
+                current_price = df['Close'].iloc[-1]
+                volatility_pct = df['ATR'].iloc[-1] * 100  # approximate daily volatility %
+                bb_width = (df['Upper_BB'].iloc[-1] - df['Lower_BB'].iloc[-1]) / df['Lower_BB'].iloc[-1]
+                rsi = df['RSI'].iloc[-1]
+
+                # LSTM and TFT predictions for next 5 days
+                lstm_preds = self.predict_horizon(df, days=5)
+                tft_preds = self.predict_horizon_tft(df, days=5)
+                if lstm_preds and tft_preds:
+                    next_day_price = (lstm_preds[0] + tft_preds[0]) / 2
+                elif lstm_preds:
+                    next_day_price = lstm_preds[0]
+                elif tft_preds:
+                    next_day_price = tft_preds[0]
+                else:
+                    next_day_price = current_price  # fallback
+
+                # Simple scoring
+                score = 0
+                if sentiment_score > 0.05:
+                    score += 20
+                if rsi > 50 and rsi < 70:
+                    score += 10
+                if volatility_pct > 3.0:
+                    score += 20
+
+                # Estimate weekly potential based on volatility
+                weekly_potential = volatility_pct * 5 
+                
+                if weekly_potential > 15: # Only show really volatile stuff
+                    results.append({
+                        "Ticker": ticker,
+                        "Current Price": f"${current_price:.2f}",
+                        "Daily Volatility": f"{volatility_pct:.1f}%",
+                        "Weekly Potential": f"±{weekly_potential:.1f}%",
+                        "News Sentiment": sentiment_score,
+                        "Headline": headlines[0][:50] + "..." if headlines else "No News",
+                        "Conviction": score + weekly_potential
+                    })
+                    
+            except Exception as e:
+                print(f"Error scanning {ticker}: {e}")
+                
+        # Sort by Conviction (Potential Return)
+        results.sort(key=lambda x: x['Conviction'], reverse=True)
+        return results
 
     def get_model(self, hidden_dim=32, num_layers=2):
         if hasattr(self, 'model') and self.model is not None:

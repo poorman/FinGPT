@@ -51,12 +51,8 @@ services:
       - "8888:8888" # Jupyter
     depends_on:
       - postgres
-    environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POLYGON_API_KEY=${POLYGON_API_KEY}
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:
@@ -77,12 +73,8 @@ services:
       - "8501:8501" # Streamlit
     depends_on:
       - postgres
-    environment:
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POLYGON_API_KEY=${POLYGON_API_KEY}
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:

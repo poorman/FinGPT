@@ -24,9 +24,11 @@ trader = st.session_state.trader
 st.sidebar.header("Global Settings")
 trader.ticker = st.sidebar.text_input("Active Ticker", value=trader.ticker)
 st.sidebar.info(trader.check_gpu())
+model_choice = st.sidebar.selectbox("Prediction Model", options=["LSTM (default)", "TFT (Transformer)"], index=0)
+st.session_state.model_choice = "tft" if model_choice.startswith("TFT") else "lstm"
 
 # TABS
-tab_single, tab_brain, tab_scanner = st.tabs(["📉 Single Stock Analysis", "🧠 Market Brain (Mass Training)", "🚀 Opportunity Scanner"])
+tab_single, tab_brain, tab_scanner, tab_alpha = st.tabs(["📉 Single Stock Analysis", "🧠 Market Brain (Mass Training)", "🚀 Opportunity Scanner", "💰 50% Week Hunter"])
 
 # ==========================================
 # SUPER TAB 1: Single Stock (Classic)
@@ -48,17 +50,23 @@ with tab_single:
                     st.error(str(e))
                     
         if st.session_state.data is not None:
-             st.markdown("---")
-             st.write("#### AI Signal")
-             signal, pred_price = trader.generate_signal()
-             
-             delta = 0
-             current_price = st.session_state.data['Close'].iloc[-1]
-             if pred_price:
-                 delta = ((pred_price - current_price) / current_price) * 100
-             
-             st.metric("Recommendation", signal, f"{delta:.2f}% Expected")
-             st.metric("Next Day Target", f"${pred_price:.2f}")
+            st.markdown("---")
+            st.write("#### AI Signal")
+            signal, pred_price = trader.generate_signal()
+            # Override prediction price if TFT model selected
+            if st.session_state.get('model_choice', 'lstm') == 'tft':
+                try:
+                    tft_preds = trader.predict_horizon_tft(st.session_state.data, days=1)
+                    if tft_preds:
+                        pred_price = tft_preds[0]
+                except Exception as e:
+                    st.error(f"TFT prediction error: {e}")
+            delta = 0
+            current_price = st.session_state.data['Close'].iloc[-1]
+            if pred_price:
+                delta = ((pred_price - current_price) / current_price) * 100
+            st.metric("Recommendation", signal, f"{delta:.2f}% Expected")
+            st.metric("Next Day Target", f"${pred_price:.2f}")
 
     with col_chart:
         if st.session_state.data is not None:
@@ -127,7 +135,10 @@ with tab_brain:
             st.error("Please fetch data in Single Stock tab first.")
         else:
             with st.spinner("Recursive Inferencing..."):
-                preds = trader.predict_horizon(st.session_state.data, days=7)
+                if st.session_state.get('model_choice', 'lstm') == 'tft':
+                    preds = trader.predict_horizon_tft(st.session_state.data, days=7)
+                else:
+                    preds = trader.predict_horizon(st.session_state.data, days=7)
                 st.session_state.prediction_horizon = preds
                 
                 cols = st.columns(7)
@@ -241,3 +252,52 @@ with tab_scanner:
 
 st.markdown("---")
 st.caption("Powered by PyTorch Recursive LSTM | Scale-Invariant Log Returns")
+
+# ==========================================
+# SUPER TAB 4: 50% Week Hunter (High Alpha)
+# ==========================================
+with tab_alpha:
+    st.header("💰 High Alpha Hunter (Targeting 50%+ Weekly Moves)")
+    st.write("This specialized scanner targets **High Volatility** stocks and utilizes **Implied Volatility indicators** to find stocks poised for massive breakout moves.")
+    
+    col_alpha_act, col_alpha_res = st.columns([1, 2])
+    
+    with col_alpha_act:
+        st.info("Scanner targets: Leveraged ETFs (TQQQ, SOXL), Crypto Proxies (MSTR, COIN), and High Beta Tech.")
+        
+        if st.button("🔎 HUNT FOR 50% RETURNS"):
+            with st.spinner("Analyzing Volatility & Momentum..."):
+                 progress_bar = st.progress(0)
+                 status_text = st.empty()
+                 
+                 # Define callback for progress
+                 def update_progress(p, msg):
+                     progress_bar.progress(p)
+                     status_text.text(msg)
+                 
+                 results = trader.scan_high_alpha_opportunities(progress_callback=update_progress)
+                 st.session_state.alpha_results = results
+                 st.success(f"Scan Complete. Found {len(results)} opportunities.")
+
+    with col_alpha_res:
+        if 'alpha_results' in st.session_state and st.session_state.alpha_results:
+             results = st.session_state.alpha_results
+             
+             if len(results) == 0:
+                 st.warning("No stocks met the criteria (High Volatility, Momentum, News). Market might be flat.")
+             else:
+                 # Display cards for top 3
+                 top_3 = results[:3]
+                 cols = st.columns(len(top_3))
+                 for i, res in enumerate(top_3):
+                     with cols[i]:
+                         st.markdown(f"### {res['Ticker']}")
+                         st.metric("Potential Return", res['Weekly Potential'], delta=res['Daily Volatility'] + " Daily Vol")
+                         st.write(f"**News Sentiment:** {res['News Sentiment']:.2f}")
+                         st.caption(res['Headline'])
+                         
+                 st.markdown("### Full Conviction Leaderboard")
+                 df_res = pd.DataFrame(results)
+                 st.dataframe(df_res[['Ticker', 'Weekly Potential', 'Daily Volatility', 'News Sentiment', 'Conviction']], height=500)
+        else:
+            st.info("Click 'HUNT' to start the analysis.")
