@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  fingpt-trader:
+    build: .
+    container_name: fingpt_trader_container
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./app:/app/app
+      # Optional: Persist huggingface cache
+      - huggingface_cache:/root/.cache/huggingface
+    ports:
+      - "8501:8501"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    command: streamlit run app/gui_dashboard.py --server.address=0.0.0.0
+
+volumes:
+  huggingface_cache:
